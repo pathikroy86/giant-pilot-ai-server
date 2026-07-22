@@ -15,6 +15,10 @@ const approvalStatuses = ['pending', 'approved', 'rejected'];
 const funderApprovalStatuses = ['pending', 'approved', 'rejected'];
 const applicationStatuses = ['pending', 'approved', 'rejected'];
 const geminiModel = process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash';
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.CLIENT_URL || process.env.FRONTEND_URL || '')
+    .split(',')
+    .map((origin) => origin.trim().replace(/\/$/, ''))
+    .filter(Boolean);
 const supportedDocumentTypes = [
     'application/pdf',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -42,7 +46,23 @@ const client = new MongoClient(uri, {
     }
 });
 
-app.use(cors());
+app.use(cors({
+    origin(origin, callback) {
+        if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes('*')) {
+            callback(null, true);
+            return;
+        }
+
+        const normalizedOrigin = origin.replace(/\/$/, '');
+
+        if (allowedOrigins.includes(normalizedOrigin)) {
+            callback(null, true);
+            return;
+        }
+
+        callback(new Error('This origin is not allowed by CORS'));
+    },
+}));
 app.use(express.json());
 
 const upload = multer({
@@ -1722,12 +1742,48 @@ async function run() {
     }
 }
 
+let startupError = null;
+const startupPromise = run().catch((error) => {
+    startupError = error;
+    console.error(error);
+});
+
+app.use(async (req, res, next) => {
+    await startupPromise;
+
+    if (startupError) {
+        const response = {
+            message: 'Backend failed to initialize',
+        };
+
+        if (process.env.NODE_ENV !== 'production') {
+            response.error = startupError.message;
+        }
+
+        return res.status(500).send(response);
+    }
+
+    next();
+});
+
 app.get('/', (req, res) => {
-    res.send('Hello World!')
-})
+    res.send({
+        name: 'GrantPilot AI API',
+        status: 'ok',
+    });
+});
 
-app.listen(port, () => {
-    console.log(`Example app listening on port ${port}`)
-})
+app.get('/api/health', (req, res) => {
+    res.send({
+        status: 'ok',
+        database: 'connected',
+    });
+});
 
-run().catch(console.dir);
+if (require.main === module) {
+    app.listen(port, () => {
+        console.log(`GrantPilot AI API listening on port ${port}`);
+    });
+}
+
+module.exports = app;
