@@ -2,7 +2,6 @@ const express = require('express');
 const app = express()
 require('dotenv').config({ override: true });
 const dns = require('node:dns');
-const crypto = require('node:crypto');
 const cors = require('cors');
 const multer = require('multer');
 const mammoth = require('mammoth');
@@ -11,9 +10,9 @@ const { MongoClient, ObjectId, ServerApiVersion } = require('mongodb');
 const port = process.env.PORT || 5000;
 const uri = process.env.MONGODB_URI;
 const dbName = process.env.DB_NAME || 'grantpilot_ai';
-const publicRoles = ['applicant', 'funder'];
 const approvalStatuses = ['pending', 'approved', 'rejected'];
 const funderApprovalStatuses = ['pending', 'approved', 'rejected'];
+const applicationStatuses = ['pending', 'approved', 'rejected'];
 const geminiModel = process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash';
 const supportedDocumentTypes = [
     'application/pdf',
@@ -56,33 +55,6 @@ const upload = multer({
     },
 });
 
-function hashPassword(password) {
-    const salt = crypto.randomBytes(16).toString('hex');
-    const hash = crypto.scryptSync(password, salt, 64).toString('hex');
-    return `${salt}:${hash}`;
-}
-
-function verifyPassword(password, storedPasswordHash) {
-    const [salt, storedHash] = storedPasswordHash.split(':');
-
-    if (!salt || !storedHash) {
-        return false;
-    }
-
-    const hashBuffer = Buffer.from(storedHash, 'hex');
-    const suppliedHashBuffer = crypto.scryptSync(password, salt, 64);
-
-    if (hashBuffer.length !== suppliedHashBuffer.length) {
-        return false;
-    }
-
-    return crypto.timingSafeEqual(hashBuffer, suppliedHashBuffer);
-}
-
-function getPublicRole(role) {
-    return publicRoles.includes(role) ? role : 'applicant';
-}
-
 function getFunderApprovalStatus(role, approvalStatus) {
     if (role !== 'funder') {
         return 'approved';
@@ -102,6 +74,137 @@ function serializeUser(user) {
             name: '',
             type: '',
         },
+    };
+}
+
+function slugify(value) {
+    return String(value || '')
+        .toLowerCase()
+        .trim()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+}
+
+async function createUniqueGrantSlug(grantsCollection, title) {
+    const baseSlug = slugify(title) || `grant-${Date.now()}`;
+    let slug = baseSlug;
+    let suffix = 2;
+
+    while (await grantsCollection.findOne({ slug }, { projection: { _id: 1 } })) {
+        slug = `${baseSlug}-${suffix}`;
+        suffix += 1;
+    }
+
+    return slug;
+}
+
+function parseFundingAmount(value) {
+    const amount = Number(String(value || '').replace(/[^0-9.]/g, ''));
+    return Number.isFinite(amount) ? amount : 0;
+}
+
+function formatFundingRange(minAmount, maxAmount) {
+    const formatter = new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: 'USD',
+        maximumFractionDigits: 0,
+    });
+
+    if (minAmount && maxAmount) {
+        return `${formatter.format(minAmount)} - ${formatter.format(maxAmount)}`;
+    }
+
+    if (maxAmount) {
+        return `Up to ${formatter.format(maxAmount)}`;
+    }
+
+    if (minAmount) {
+        return `From ${formatter.format(minAmount)}`;
+    }
+
+    return 'Funding amount not specified';
+}
+
+function parseList(value) {
+    if (Array.isArray(value)) {
+        return value.map((item) => String(item).trim()).filter(Boolean);
+    }
+
+    return String(value || '')
+        .split(/\r?\n|,/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+}
+
+function getDeadlineBucket(deadline) {
+    if (!deadline || deadline === 'Rolling') {
+        return 'No deadline';
+    }
+
+    const deadlineDate = new Date(`${deadline}T00:00:00`);
+
+    if (Number.isNaN(deadlineDate.getTime())) {
+        return 'No deadline';
+    }
+
+    const days = Math.ceil((deadlineDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
+
+    if (days < 0) return 'Past';
+    if (days <= 30) return '0-30 days';
+    if (days <= 60) return '31-60 days';
+    return '60+ days';
+}
+
+function buildGrantInsights(grants) {
+    const categoryGroups = new Map();
+    const deadlineBuckets = ['0-30 days', '31-60 days', '60+ days', 'Past', 'No deadline'];
+    const totalFunding = grants.reduce((sum, grant) => sum + Number(grant.maxAmount || 0), 0);
+    const averageMatch = grants.length
+        ? Math.round(grants.reduce((sum, grant) => sum + Number(grant.match || 0), 0) / grants.length)
+        : 0;
+
+    grants.forEach((grant) => {
+        const category = grant.category || 'Other';
+        const current = categoryGroups.get(category) || {
+            category,
+            grants: 0,
+            totalFunding: 0,
+            averageMatch: 0,
+        };
+
+        current.grants += 1;
+        current.totalFunding += Number(grant.maxAmount || 0);
+        current.averageMatch += Number(grant.match || 0);
+        categoryGroups.set(category, current);
+    });
+
+    const categoryData = Array.from(categoryGroups.values())
+        .map((item) => ({
+            ...item,
+            averageMatch: item.grants ? Math.round(item.averageMatch / item.grants) : 0,
+            fundingLabel: `$${Math.round(item.totalFunding / 1000)}k`,
+        }))
+        .sort((a, b) => b.grants - a.grants)
+        .slice(0, 8);
+
+    const deadlineData = deadlineBuckets
+        .map((bucket) => ({
+            name: bucket,
+            value: grants.filter((grant) => getDeadlineBucket(grant.deadline) === bucket).length,
+        }))
+        .filter((item) => item.value > 0);
+
+    return {
+        summary: {
+            approvedGrants: grants.length,
+            totalFunding,
+            averageMatch,
+            categories: categoryGroups.size,
+        },
+        categoryData,
+        fundingData: categoryData,
+        deadlineData,
+        generatedAt: new Date(),
     };
 }
 
@@ -393,6 +496,7 @@ async function run() {
         const savedGrantsCollection = db.collection('savedGrants');
         const eligibilityReportsCollection = db.collection('eligibilityReports');
         const documentAnalysesCollection = db.collection('documentAnalyses');
+        const grantApplicationsCollection = db.collection('grantApplications');
 
         await usersCollection.createIndex({ email: 1 }, { unique: true });
         await sessionsCollection.createIndex({ token: 1 }, { unique: true });
@@ -403,6 +507,9 @@ async function run() {
         await savedGrantsCollection.createIndex({ userId: 1, updatedAt: -1 });
         await eligibilityReportsCollection.createIndex({ userId: 1, grantSlug: 1, createdAt: -1 });
         await documentAnalysesCollection.createIndex({ userId: 1, createdAt: -1 });
+        await grantApplicationsCollection.createIndex({ applicantId: 1, grantSlug: 1 }, { unique: true });
+        await grantApplicationsCollection.createIndex({ funderId: 1, updatedAt: -1 });
+        await grantApplicationsCollection.createIndex({ grantId: 1, status: 1 });
 
         const verifyToken = async (req, res, next) => {
             const authHeader = req.headers?.authorization;
@@ -435,94 +542,6 @@ async function run() {
 
             next();
         };
-
-        app.post('/api/users', async (req, res) => {
-            try {
-                const { name, email, password, organizationName, organizationType, role } = req.body;
-                const normalizedEmail = email?.trim().toLowerCase();
-                const selectedRole = getPublicRole(role);
-
-                if (!name?.trim() || !normalizedEmail || !password) {
-                    return res.status(400).send({ message: 'Name, email, and password are required' });
-                }
-
-                if (password.length < 6) {
-                    return res.status(400).send({ message: 'Password must be at least 6 characters' });
-                }
-
-                const user = {
-                    name: name.trim(),
-                    email: normalizedEmail,
-                    passwordHash: hashPassword(password),
-                    role: selectedRole,
-                    funderApprovalStatus: getFunderApprovalStatus(selectedRole, 'pending'),
-                    organizationProfile: {
-                        name: organizationName?.trim() || '',
-                        type: organizationType?.trim() || '',
-                    },
-                    preferences: {
-                        categories: [],
-                        regions: [],
-                    },
-                    createdAt: new Date(),
-                    updatedAt: new Date(),
-                };
-
-                const result = await usersCollection.insertOne(user);
-                const token = crypto.randomBytes(32).toString('hex');
-
-                await sessionsCollection.insertOne({
-                    token,
-                    userId: result.insertedId,
-                    createdAt: new Date(),
-                });
-
-                res.status(201).send({
-                    insertedId: result.insertedId,
-                    token,
-                    user: serializeUser({ ...user, _id: result.insertedId }),
-                });
-            } catch (error) {
-                if (error.code === 11000) {
-                    return res.status(409).send({ message: 'An account with this email already exists' });
-                }
-
-                res.status(500).send({ message: 'Failed to create account' });
-            }
-        });
-
-        app.post('/api/login', async (req, res) => {
-            try {
-                const { email, password } = req.body;
-                const normalizedEmail = email?.trim().toLowerCase();
-
-                if (!normalizedEmail || !password) {
-                    return res.status(400).send({ message: 'Email and password are required' });
-                }
-
-                const user = await usersCollection.findOne({ email: normalizedEmail });
-
-                if (!user || !verifyPassword(password, user.passwordHash || '')) {
-                    return res.status(401).send({ message: 'Invalid email or password' });
-                }
-
-                const token = crypto.randomBytes(32).toString('hex');
-
-                await sessionsCollection.insertOne({
-                    token,
-                    userId: user._id,
-                    createdAt: new Date(),
-                });
-
-                res.send({
-                    message: 'Login successful',
-                    token,
-                    user: serializeUser(user),
-                });
-            } catch (error) {
-                res.status(500).send({ message: 'Failed to sign in' });
-            }
-        });
 
         app.get('/api/grants', async (req, res) => {
             const query = { approvalStatus: 'approved' };
@@ -564,6 +583,98 @@ async function run() {
             }
 
             res.send(grant);
+        });
+
+        app.get('/api/insights', async (req, res) => {
+            const grants = await grantsCollection
+                .find({ approvalStatus: 'approved' })
+                .sort({ updatedAt: -1 })
+                .toArray();
+
+            res.send(buildGrantInsights(grants));
+        });
+
+        app.get('/api/my/dashboard', verifyToken, async (req, res) => {
+            const [approvedGrants, savedItems, eligibilityReports, recentInteractions, applications] = await Promise.all([
+                grantsCollection
+                    .find({ approvalStatus: 'approved' })
+                    .sort({ match: -1, updatedAt: -1 })
+                    .limit(12)
+                    .toArray(),
+                savedGrantsCollection
+                    .find({ userId: req.user._id })
+                    .sort({ updatedAt: -1 })
+                    .toArray(),
+                eligibilityReportsCollection
+                    .find({ userId: req.user._id })
+                    .sort({ createdAt: -1 })
+                    .limit(6)
+                    .toArray(),
+                interactionsCollection
+                    .find({ userId: req.user._id })
+                    .sort({ createdAt: -1 })
+                    .limit(8)
+                    .toArray(),
+                grantApplicationsCollection
+                    .find({ applicantId: req.user._id })
+                    .sort({ updatedAt: -1 })
+                    .toArray(),
+            ]);
+            const grantSlugs = [
+                ...savedItems.map((item) => item.grantSlug),
+                ...eligibilityReports.map((report) => report.grantSlug),
+                ...applications.map((application) => application.grantSlug),
+            ];
+            const relatedGrants = grantSlugs.length
+                ? await grantsCollection
+                    .find({ slug: { $in: grantSlugs }, approvalStatus: 'approved' })
+                    .toArray()
+                : [];
+            const grantsBySlug = new Map(relatedGrants.map((grant) => [grant.slug, grant]));
+            const savedGrants = savedItems
+                .map((savedItem) => ({
+                    ...savedItem,
+                    grant: grantsBySlug.get(savedItem.grantSlug) || null,
+                }))
+                .filter((savedItem) => savedItem.grant);
+            const reports = eligibilityReports
+                .map((report) => ({
+                    ...report,
+                    grant: grantsBySlug.get(report.grantSlug) || null,
+                }))
+                .filter((report) => report.grant);
+            const grantApplications = applications
+                .map((application) => ({
+                    ...application,
+                    grant: grantsBySlug.get(application.grantSlug) || null,
+                }))
+                .filter((application) => application.grant);
+            const highMatchCount = approvedGrants.filter((grant) => Number(grant.match || 0) >= 85).length;
+            const readinessScore = Math.min(
+                100,
+                savedGrants.length * 20 +
+                reports.length * 25 +
+                grantApplications.length * 20 +
+                recentInteractions.filter((interaction) => interaction.eventType?.startsWith('ai_')).length * 10
+            );
+
+            res.send({
+                user: serializeUser(req.user),
+                stats: {
+                    approvedGrants: approvedGrants.length,
+                    highMatchCount,
+                    savedGrants: savedGrants.length,
+                    eligibilityReports: reports.length,
+                    applications: grantApplications.length,
+                    approvedApplications: grantApplications.filter((application) => application.status === 'approved').length,
+                    readinessScore,
+                },
+                recommendedGrants: approvedGrants.slice(0, 6),
+                savedGrants,
+                eligibilityReports: reports,
+                applications: grantApplications,
+                recentInteractions,
+            });
         });
 
         app.get('/api/my/saved-grants', verifyToken, async (req, res) => {
@@ -617,6 +728,91 @@ async function run() {
             });
 
             res.send({ message: 'Grant saved', savedGrant: saved });
+        });
+
+        app.post('/api/grants/:slug/apply', verifyToken, async (req, res) => {
+            try {
+                if (!['applicant', 'user'].includes(req.user?.role)) {
+                    return res.status(403).send({ message: 'Grant seeker access required' });
+                }
+
+                const grant = await grantsCollection.findOne({
+                    slug: req.params.slug,
+                    approvalStatus: 'approved',
+                });
+
+                if (!grant) {
+                    return res.status(404).send({ message: 'Grant not found or not approved' });
+                }
+
+                const {
+                    projectTitle,
+                    requestedAmount,
+                    proposalSummary,
+                    evidenceNotes,
+                    contactEmail,
+                } = req.body;
+
+                if (!projectTitle?.trim() || !proposalSummary?.trim()) {
+                    return res.status(400).send({ message: 'Project title and proposal summary are required' });
+                }
+
+                const now = new Date();
+                const application = {
+                    applicantId: req.user._id,
+                    applicantName: req.user.name,
+                    applicantEmail: req.user.email,
+                    applicantOrganization: req.user.organizationProfile || {},
+                    funderId: grant.createdBy || null,
+                    grantId: grant._id,
+                    grantSlug: grant.slug,
+                    grantTitle: grant.title,
+                    funderName: grant.funder,
+                    projectTitle: projectTitle.trim(),
+                    requestedAmount: parseFundingAmount(requestedAmount),
+                    proposalSummary: proposalSummary.trim(),
+                    evidenceNotes: evidenceNotes?.trim() || '',
+                    contactEmail: contactEmail?.trim() || req.user.email,
+                    status: 'pending',
+                    updatedAt: now,
+                };
+
+                await grantApplicationsCollection.updateOne(
+                    { applicantId: req.user._id, grantSlug: grant.slug },
+                    {
+                        $set: application,
+                        $setOnInsert: { createdAt: now },
+                    },
+                    { upsert: true }
+                );
+
+                const savedApplication = await grantApplicationsCollection.findOne({
+                    applicantId: req.user._id,
+                    grantSlug: grant.slug,
+                });
+
+                await interactionsCollection.insertOne({
+                    userId: req.user._id,
+                    eventType: 'grant_application',
+                    metadata: { grantSlug: grant.slug, status: 'pending' },
+                    output: {
+                        projectTitle: application.projectTitle,
+                        requestedAmount: application.requestedAmount,
+                    },
+                    createdAt: now,
+                });
+
+                res.status(201).send({
+                    message: 'Application submitted to the funder for eligibility review',
+                    application: savedApplication,
+                });
+            } catch (error) {
+                if (error.code === 11000) {
+                    return res.status(409).send({ message: 'You already applied to this grant' });
+                }
+
+                res.status(500).send({ message: error.message || 'Failed to apply for grant' });
+            }
         });
 
         app.post('/api/grants/:slug/eligibility', verifyToken, async (req, res) => {
@@ -1200,6 +1396,166 @@ async function run() {
             res.send(grants);
         });
 
+        app.get('/api/my/grant-applications', verifyToken, async (req, res) => {
+            if (!['funder', 'admin'].includes(req.user?.role)) {
+                return res.status(403).send({ message: 'Funder access required' });
+            }
+
+            if (req.user?.role === 'funder' && getFunderApprovalStatus(req.user.role, req.user.funderApprovalStatus) !== 'approved') {
+                return res.status(403).send({ message: 'Your funder registration is waiting for admin approval.' });
+            }
+
+            const grantQuery = req.user.role === 'admin' ? {} : { createdBy: req.user._id };
+            const grants = await grantsCollection.find(grantQuery).toArray();
+            const grantsById = new Map(grants.map((grant) => [grant._id.toString(), grant]));
+            const grantIds = grants.map((grant) => grant._id);
+            const applications = grantIds.length
+                ? await grantApplicationsCollection
+                    .find({ grantId: { $in: grantIds } })
+                    .sort({ updatedAt: -1 })
+                    .toArray()
+                : [];
+
+            res.send(applications.map((application) => ({
+                ...application,
+                grant: grantsById.get(application.grantId.toString()) || null,
+            })).filter((application) => application.grant));
+        });
+
+        app.post('/api/my/grants', verifyToken, async (req, res) => {
+            try {
+                if (!['funder', 'admin'].includes(req.user?.role)) {
+                    return res.status(403).send({ message: 'Funder access required' });
+                }
+
+                if (req.user?.role === 'funder' && getFunderApprovalStatus(req.user.role, req.user.funderApprovalStatus) !== 'approved') {
+                    return res.status(403).send({ message: 'Your funder registration is waiting for admin approval.' });
+                }
+
+                const {
+                    title,
+                    category,
+                    summary,
+                    minAmount,
+                    maxAmount,
+                    deadline,
+                    region,
+                    source,
+                    eligibility,
+                } = req.body;
+                const cleanedTitle = title?.trim();
+                const cleanedSummary = summary?.trim();
+                const cleanedCategory = category?.trim();
+
+                if (!cleanedTitle || !cleanedSummary || !cleanedCategory) {
+                    return res.status(400).send({ message: 'Title, category, and summary are required' });
+                }
+
+                const parsedMinAmount = parseFundingAmount(minAmount);
+                const parsedMaxAmount = parseFundingAmount(maxAmount);
+                const slug = await createUniqueGrantSlug(grantsCollection, cleanedTitle);
+                const funderName = req.user.organizationProfile?.name || req.user.name;
+                const grant = {
+                    slug,
+                    title: cleanedTitle,
+                    funder: funderName,
+                    category: cleanedCategory,
+                    summary: cleanedSummary,
+                    amount: formatFundingRange(parsedMinAmount, parsedMaxAmount),
+                    minAmount: parsedMinAmount,
+                    maxAmount: parsedMaxAmount,
+                    deadline: deadline?.trim() || 'Rolling',
+                    region: region?.trim() || 'Not specified',
+                    source: source?.trim() || 'Funder submitted',
+                    eligibility: parseList(eligibility),
+                    match: 70,
+                    status: 'Open',
+                    approvalStatus: 'pending',
+                    createdBy: req.user._id,
+                    createdByEmail: req.user.email,
+                    createdAt: new Date(),
+                    updatedAt: new Date(),
+                };
+
+                const result = await grantsCollection.insertOne(grant);
+                const savedGrant = {
+                    ...grant,
+                    _id: result.insertedId,
+                };
+
+                res.status(201).send({
+                    message: 'Grant submitted for admin approval',
+                    grant: savedGrant,
+                });
+            } catch (error) {
+                res.status(500).send({ message: error.message || 'Failed to submit grant' });
+            }
+        });
+
+        app.patch('/api/my/grant-applications/:id/status', verifyToken, async (req, res) => {
+            try {
+                if (!['funder', 'admin'].includes(req.user?.role)) {
+                    return res.status(403).send({ message: 'Funder access required' });
+                }
+
+                if (req.user?.role === 'funder' && getFunderApprovalStatus(req.user.role, req.user.funderApprovalStatus) !== 'approved') {
+                    return res.status(403).send({ message: 'Your funder registration is waiting for admin approval.' });
+                }
+
+                const { id } = req.params;
+                const { status: applicationStatus, funderNote = '' } = req.body;
+
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ message: 'Invalid application id' });
+                }
+
+                if (!applicationStatuses.includes(applicationStatus)) {
+                    return res.status(400).send({ message: 'Invalid application status' });
+                }
+
+                const application = await grantApplicationsCollection.findOne({ _id: new ObjectId(id) });
+
+                if (!application) {
+                    return res.status(404).send({ message: 'Application not found' });
+                }
+
+                const grant = await grantsCollection.findOne({ _id: application.grantId });
+
+                if (!grant) {
+                    return res.status(404).send({ message: 'Grant not found' });
+                }
+
+                if (req.user.role !== 'admin' && grant.createdBy?.toString() !== req.user._id.toString()) {
+                    return res.status(403).send({ message: 'Only the grant funder can review this application' });
+                }
+
+                const update = {
+                    $set: {
+                        status: applicationStatus,
+                        funderNote: funderNote.trim(),
+                        reviewedBy: req.user._id,
+                        reviewedAt: new Date(),
+                        updatedAt: new Date(),
+                    },
+                };
+
+                await grantApplicationsCollection.updateOne({ _id: application._id }, update);
+                const updatedApplication = await grantApplicationsCollection.findOne({ _id: application._id });
+
+                res.send({
+                    message: applicationStatus === 'approved'
+                        ? 'Grant seeker marked eligible for this grant'
+                        : `Application marked as ${applicationStatus}`,
+                    application: {
+                        ...updatedApplication,
+                        grant,
+                    },
+                });
+            } catch (error) {
+                res.status(500).send({ message: error.message || 'Failed to update application' });
+            }
+        });
+
         app.patch('/api/admin/funders/:id/approval', verifyToken, verifyAdmin, async (req, res) => {
             const { id } = req.params;
             const { approvalStatus } = req.body;
@@ -1293,6 +1649,7 @@ async function run() {
                 grantsCollection.deleteOne({ _id: grant._id }),
                 savedGrantsCollection.deleteMany({ grantSlug: grant.slug }),
                 eligibilityReportsCollection.deleteMany({ grantSlug: grant.slug }),
+                grantApplicationsCollection.deleteMany({ grantSlug: grant.slug }),
             ]);
 
             res.send({ message: 'Rejected grant deleted', deletedId: id });
