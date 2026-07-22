@@ -2,6 +2,7 @@ const express = require('express');
 const app = express()
 require('dotenv').config({ override: true });
 const dns = require('node:dns');
+const crypto = require('node:crypto');
 const cors = require('cors');
 const multer = require('multer');
 const mammoth = require('mammoth');
@@ -22,6 +23,10 @@ const supportedDocumentTypes = [
 
 if (!uri) {
     throw new Error('MONGODB_URI is required');
+}
+
+if (!process.env.JWT_SECRET) {
+    throw new Error('JWT_SECRET is required');
 }
 
 dns.setServers((process.env.MONGODB_DNS_SERVERS || '8.8.8.8,1.1.1.1')
@@ -75,6 +80,44 @@ function serializeUser(user) {
             type: '',
         },
     };
+}
+
+function verifyBackendJwt(token) {
+    const parts = token?.split('.') || [];
+
+    if (parts.length !== 3) {
+        throw new Error('Invalid token');
+    }
+
+    const [encodedHeader, encodedPayload, encodedSignature] = parts;
+    const signedValue = `${encodedHeader}.${encodedPayload}`;
+    const expectedSignature = crypto
+        .createHmac('sha256', process.env.JWT_SECRET)
+        .update(signedValue)
+        .digest();
+    const suppliedSignature = Buffer.from(encodedSignature, 'base64url');
+
+    if (
+        suppliedSignature.length !== expectedSignature.length ||
+        !crypto.timingSafeEqual(suppliedSignature, expectedSignature)
+    ) {
+        throw new Error('Invalid token signature');
+    }
+
+    const header = JSON.parse(Buffer.from(encodedHeader, 'base64url').toString('utf8'));
+
+    if (header.alg !== 'HS256' || header.typ !== 'JWT') {
+        throw new Error('Invalid token header');
+    }
+
+    const payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'));
+    const now = Math.floor(Date.now() / 1000);
+
+    if (!payload.sub || !payload.exp || payload.exp < now) {
+        throw new Error('Expired token');
+    }
+
+    return payload;
 }
 
 function slugify(value) {
@@ -489,7 +532,6 @@ async function run() {
 
         const db = client.db(dbName);
         const usersCollection = db.collection('users');
-        const sessionsCollection = db.collection('sessions');
         const grantsCollection = db.collection('grants');
         const conversationsCollection = db.collection('conversations');
         const interactionsCollection = db.collection('interactions');
@@ -499,7 +541,6 @@ async function run() {
         const grantApplicationsCollection = db.collection('grantApplications');
 
         await usersCollection.createIndex({ email: 1 }, { unique: true });
-        await sessionsCollection.createIndex({ token: 1 }, { unique: true });
         await grantsCollection.createIndex({ slug: 1 }, { unique: true });
         await conversationsCollection.createIndex({ userId: 1, updatedAt: -1 });
         await interactionsCollection.createIndex({ userId: 1, createdAt: -1 });
@@ -519,13 +560,22 @@ async function run() {
                 return res.status(401).send({ message: 'Unauthorized access' });
             }
 
-            const session = await sessionsCollection.findOne({ token });
+            let payload;
 
-            if (!session) {
+            try {
+                payload = verifyBackendJwt(token);
+            } catch {
                 return res.status(401).send({ message: 'Unauthorized access' });
             }
 
-            const user = await usersCollection.findOne({ _id: session.userId });
+            if (!ObjectId.isValid(payload.sub)) {
+                return res.status(401).send({ message: 'Unauthorized access' });
+            }
+
+            const user = await usersCollection.findOne({
+                _id: new ObjectId(payload.sub),
+                email: payload.email,
+            });
 
             if (!user) {
                 return res.status(401).send({ message: 'Unauthorized access' });
